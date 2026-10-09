@@ -63,10 +63,10 @@ this number before you look at the point cloud.
 ## Measuring the states from the photos (`estimate`)
 
 Every camera looks at the same target, so seen from the target a camera is fully described by two
-numbers per photo: its **attitude** (how the target looks turned, relative to photo 1) and its
-**distance** (as a multiple of photo 1's). Photo 1 is the origin: yaw, pitch and roll 0. Its
-attitude only turns the whole scene and its distance only scales it, so neither changes the shape.
-`estimate` measures both numbers for every photo, from the photos alone:
+quantities per photo: its **attitude** (how the target looks turned, relative to photo 1: yaw,
+pitch and roll) and its **distance** (as a multiple of photo 1's), 4 numbers in all. Photo 1 is the
+origin: yaw, pitch and roll 0. Its attitude only turns the whole scene and its distance only scales
+it, so neither changes the shape. `estimate` measures both for every photo, from the photos alone:
 
 ```bash
 pip install -r requirements-estimate.txt      # PyTorch with CUDA, LightGlue, numba, OpenCV, scipy
@@ -85,7 +85,7 @@ the masks and the lens, nothing else:
 * **No background.** Only the target's pixels are used: the background is empty sky or moves on its
   own in real use, and the target is the one thing all the photos share.
 * **The camera points at the target.** Each photo's centre is the target's centre (the hub), as a
-  tracker keeps it. That is what makes two numbers per photo enough.
+  tracker keeps it. That is what makes 4 numbers per photo enough (COLMAP solves 6).
 
 How it works (`estimate.py`, read top to bottom; each stage is timed):
 
@@ -157,13 +157,66 @@ placed, the time the median wall time.
 | all 240 observers | 239/240, IoU 0.992, 34.3 s | 234/240, IoU 0.07, 33.8 s | 0/240, 79.6 s |
 | the 360-photo orbit, shuffled | 360/360, IoU 0.996, 54.4 s | 360/360, IoU 0.30, 122.3 s | not run |
 
-COLMAP is 2 to 3.3 times faster up to 96 photos, as fast at 240 photos, and takes twice as long on
-the 360-photo orbit. But on these swarms it places few photos, or builds folded models: the aircraft
-looks the same from the left and from the right (it carries the same decals on both sides), and
-pairs matched across the two sides pull cameras on opposite sides together. `estimate` rejects
-those links (two-view checks and robust rotation averaging) and places the observers with too few
-matches from their silhouettes. The incremental mapper's IoU of 0.98 at 24 photos is a hull from 3
-cameras.
+COLMAP's global mapper is 2 to 3.3 times faster up to 96 photos, as fast at 240 photos, and takes
+twice as long on the 360-photo orbit. But on these swarms it places few photos, or builds bent
+models: the aircraft looks the same from the left and from the right (it carries the same decals on
+both sides), so some pairs matched across the two sides pass COLMAP's checks, and those false links
+bend the model. `estimate` rejects them (two-view checks and robust rotation averaging) and places
+the observers with too few matches from their silhouettes. The incremental mapper's IoU of 0.98 at
+24 photos is a hull from 3 cameras.
+
+#### How the time grows with the swarm
+
+Denser swarms, drawn from 960 renders (the 240 above plus 720 more from the same script): three new
+random swarms per size up to 240 (seeds 1001 to 1003), one at 480 and all 960. COLMAP also ran with
+its vocabulary-tree matcher, its own recipe for large photo sets, with its default tree. Same
+machine, networks loaded, 8 CPU threads each (COLMAP's vocabulary-tree search used all 24); "right"
+means a hull IoU of at least 0.95 with at least 90 % placed, "gave up" fewer than 3 photos placed
+with photo 1.
+
+![time against swarm size](docs/scaling.png)
+
+| photos | ours | COLMAP, every pair | COLMAP, vocabulary tree | COLMAP incremental |
+|---|---|---|---|---|
+| 12 | 2.7 s, 3 of 3 right | 1.1 s, 0 of 3 (2 gave up) | 2.1 s, 0 of 3 (3 gave up) | 1.0 s, 0 of 3 (3 gave up) |
+| 48 | 9.8 s, 3 of 3 right | 3.0 s, 0 of 3 | 6.2 s, 0 of 3 | 2.6 s, 0 of 3 (3 gave up) |
+| 96 | 15.4 s, 3 of 3 right | 7.2 s, 0 of 3 (1 gave up) | 13.1 s, 0 of 3 (1 gave up) | 16.2 s, 0 of 3 (3 gave up) |
+| 240 | 34.6 s, 3 of 3 right | 29.2 s, 0 of 3 | 46.0 s, 0 of 3 | 103 s, 0 of 3 |
+| 480 | 93.1 s, right | 115 s, wrong | 113 s, wrong | not run |
+| 960 | 209 s, right | 325 s, wrong | 390 s, wrong | not run |
+
+The lines cross near 330 photos, by interpolation: nothing ran between 240 and 480, the two largest
+sizes are single swarms, and on one of the three 240-photo swarms `estimate` was already the faster.
+Below that COLMAP finishes sooner, often by giving up, while `estimate` matches every pair with
+LightGlue up to 64 photos (about 8 times COLMAP's cost per pair) and describes each photo at three
+rolls up to 40 photos.
+
+Matching every pair is what grows for COLMAP: at 960 photos it spent 196 of its 325 s matching
+460,320 pairs. Beyond 64 photos `estimate` matches each photo with its 12 most similar and photo 1
+with every photo, then, while mapping, the pairs its estimate says overlap: 12,914 pairs at 960
+photos (91 s of its 209 s, with the two-view checks). The vocabulary tree cut COLMAP's matching to
+120 s, but its global mapper then took 241 s. From 96 to 960 photos the time of `estimate` grew
+14-fold, COLMAP's 30-fold (vocabulary tree) and 45-fold (every pair). At this size mapping decides
+the race, and COLMAP's mappers ran on the CPU (this build's bundle adjustment has no GPU support):
+outside mapping, its vocabulary-tree run took 149 s. A build with GPU bundle adjustment was not
+tried.
+
+No COLMAP run gave the right shape. 22 of its 58 runs gave up, and 18 placed 8 % to just under 90 %
+of the photos (the four with a hull IoU above 0.9 are hulls from 3 or 4 cameras). The 18 that placed
+90 % or more had a hull IoU of 0.02 to 0.48, and their models are bent rather than mirrored: even
+after the best single rotation onto the truth, 16 of them kept over half their cameras more than 10°
+off. A hull keeps only what every photo agrees on, so a few bad cameras carve most of it away: the
+vocabulary-tree run on all 960 placed 948 of its 956 cameras within 10° (median 0.5°) and still had
+an IoU of 0.18; carved without the other 8 it would have been 0.87.
+
+**A 3-D model, not just poses.** COLMAP's route to a model continues with dense stereo (PatchMatch
+on every photo, then fusion). Given the true poses, so that pose errors could not spoil it, its
+defaults (full frames, up to 20 neighbouring photos each, on the GPU) took 7.1 min for 12 photos,
+17.7 min for 24 and 36.1 min for 48, 36 to 45 s per photo. The aircraft fills a median of 8 % of
+each frame, so cropping would cut that, though likely not to seconds. For the same swarms `poses`
+and the C++ carve take 0.7 to 2.1 s, so `estimate` + carve gives a model of 48 photos in about 12 s.
+The two are not the same product: dense stereo recovers hollows and fine relief that a silhouette
+hull cannot.
 
 ## Conventions
 

@@ -75,7 +75,7 @@ def test_rotation_averaging_ignores_doppelganger_links():
         e["R"] = turn([0, 0, 1], 170) @ e["R"]
         e["m"] = np.zeros((60, 2))
         wrong.append(k)
-    R, member, keep, anchor, _ = est._global_attitudes(n, edges, np.random.default_rng(0))
+    R, member, keep, anchor, _, _ = est._global_attitudes(n, edges, np.random.default_rng(0))
     assert member.all()
     assert not keep[wrong].any()
     errors = [angle_deg(R[j] @ R[i].T, R_true[j] @ R_true[i].T) for i in range(n) for j in range(n)]

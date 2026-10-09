@@ -878,7 +878,8 @@ def _edge_residuals(R, I, J, Rij, W):
 
 
 def _chain(n, I, J, Rij, weight, root=0):
-    """Attitudes chained along the maximum spanning tree (by weight) from `root` (R_j = R_ij R_i)."""
+    """Attitudes chained along the maximum spanning tree (by weight) from `root` (R_j = R_ij R_i); also the tree
+    (parent of each observer, negative for the root and for observers the tree does not reach)."""
     tree = minimum_spanning_tree(sp.coo_matrix((-weight, (I, J)), shape=(n, n)).tocsr())
     tree = tree + tree.T
     lookup = {(i, j): k for k, (i, j) in enumerate(zip(I, J))}
@@ -887,7 +888,7 @@ def _chain(n, I, J, Rij, weight, root=0):
     for v in order[1:]:
         p = parent[v]
         R[v] = Rij[lookup[(p, v)]] @ R[p] if (p, v) in lookup else Rij[lookup[(v, p)]].T @ R[p]
-    return R
+    return R, parent
 
 
 def _average_rotations(R, I, J, Rij, W, anchor, c=4.0, iters=20):
@@ -943,12 +944,12 @@ def _global_attitudes(n, edges, rng, trees=24, c=4.0):
     best = None
     for t in range(trees):
         wt = ninl * (1.0 if t == 0 else rng.uniform(0.3, 1.0, len(ninl)))
-        R = _chain(n, I, J, Rij, wt, anchor)
+        R, tree = _chain(n, I, J, Rij, wt, anchor)
         _, r = _edge_residuals(R, I, J, Rij, W)
         support = np.sum(np.minimum(r, 3 * c) ** 2 * member[I])
         if best is None or support < best[0]:
-            best = (support, R)
-    R = best[1]
+            best = (support, R, tree)
+    R, tree = best[1], best[2]
     R_chain = R.copy()
     keep = member[I] & member[J]
     for _ in range(2):
@@ -962,7 +963,7 @@ def _global_attitudes(n, edges, rng, trees=24, c=4.0):
         anchor = anchor2
     keep &= member[I] & member[J]
     R = _average_rotations(R, I[keep], J[keep], Rij[keep], W[keep], anchor, c)   # once more with the final edge set
-    return R, member, keep, anchor, R_chain
+    return R, member, keep, anchor, R_chain, tree
 
 
 def _view_groups(n, edges, rng):
@@ -975,13 +976,13 @@ def _view_groups(n, edges, rng):
     J = np.array([e["j"] for e in edges])
     while avail.any():
         sub = [e for e, a in zip(edges, avail) if a]
-        R, member, keep, anchor, R_chain = _global_attitudes(n, sub, rng)
+        R, member, keep, anchor, R_chain, tree = _global_attitudes(n, sub, rng)
         kept = [e for e, k in zip(sub, keep) if k]
         if member.sum() < 2 or not kept:
             break
         d = _global_distances(n, np.array([e["i"] for e in kept]), np.array([e["j"] for e in kept]),
                               np.array([e["rho"] for e in kept]), np.array([len(e["m"]) for e in kept], float), anchor)
-        groups.append(dict(R=R, d=d, member=member, kept=kept, anchor=anchor, R_chain=R_chain))
+        groups.append(dict(R=R, d=d, member=member, kept=kept, anchor=anchor, R_chain=R_chain, tree=tree))
         avail &= ~(member[I] | member[J])
     return groups
 
@@ -2063,7 +2064,22 @@ def _viz_result(ctx, st):
             x, y = int(round(p[0])), int(round(p[1]))
             if 0 <= y < img.shape[0] and 0 <= x < img.shape[1]:
                 rgb[q] = img[y, x, ::-1] / 255.0
+    # the spanning tree the attitudes were chained along: per observer its parent, and that pair's turn (R_child =
+    # tree_R @ R_parent), distance ratio (d_child / d_parent) and verified matches; -1 / I / 1 / 0 off the tree
+    t_parent, t_R, t_rho, t_inl = np.full(ctx.n, -1), np.tile(np.eye(3), (ctx.n, 1, 1)), np.ones(ctx.n), np.zeros(ctx.n, int)
+    by_pair = {(e["i"], e["j"]): e for e in edges}
+    for v, p in enumerate(getattr(ctx, "viz_tree", np.full(ctx.n, -1))):
+        if p < 0:
+            continue
+        e = by_pair.get((int(p), v)) or by_pair.get((v, int(p)))
+        if e is None:
+            continue
+        fwd = e["i"] == p
+        t_parent[v], t_inl[v] = int(p), len(e["m"])
+        t_R[v] = e["R"] if fwd else e["R"].T
+        t_rho[v] = e["rho"] if fwd else 1.0 / e["rho"]
     return dict(pair_names=names, pair_kinds=kinds, pair_kp0=kp0, pair_kp1=kp1,
+                tree_parent=t_parent, tree_R=t_R, tree_rho=t_rho, tree_inliers=t_inl,
                 edges=np.array([(e["i"], e["j"]) for e in edges], int).reshape(-1, 2),
                 edge_inliers=nin.astype(int), stage_names=stages, stage_R_rel=np.array(SR), stage_d_rel=np.array(Sd),
                 registered=reg.tolist(), points=Xo, points_rgb=rgb, history=list(_VIZ["history"]))
@@ -2110,6 +2126,12 @@ def estimate(image_paths, mask_paths, K, progress=None, viz=False):
             v = out["viz"]
             v["edges"] = seen[v["edges"]] if len(v["edges"]) else v["edges"]
             v["registered"] = [int(seen[i]) for i in v["registered"]]
+            tp, tR, trho, tinl = v["tree_parent"], v["tree_R"], v["tree_rho"], v["tree_inliers"]
+            v["tree_parent"] = np.full(n_all, -1)
+            v["tree_R"], v["tree_rho"], v["tree_inliers"] = np.tile(np.eye(3), (n_all, 1, 1)), np.ones(n_all), np.zeros(n_all, int)
+            for k, i in enumerate(seen):
+                v["tree_parent"][i] = int(seen[tp[k]]) if tp[k] >= 0 else -1
+                v["tree_R"][i], v["tree_rho"][i], v["tree_inliers"][i] = tR[k], trho[k], tinl[k]
         return out
     finally:
         _VIZ = None
@@ -2166,6 +2188,7 @@ def _estimate(data, K, clock, paths, viz):
         if viz:
             dn = np.where(g0["member"], g0["d"], np.nan)
             ctx.viz_stages = [("chained (spanning tree)", g0["R_chain"], dn), ("rotation averaging", g0["R"], dn)]
+            ctx.viz_tree = g0["tree"]
 
     st = _State(g0["R"].copy(), g0["d"].copy(), g0["member"].copy())
     trk, cam, kidx, kp = _tracks(feats, [(e["i"], e["j"], e["m"]) for e in g0["kept"]], n)
