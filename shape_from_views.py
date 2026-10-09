@@ -1,7 +1,8 @@
 """shape_from_views: camera poses from state estimates + a visual hull, as COLMAP files.
 
   python shape_from_views.py orbit      DATASET [focal_mm sensor_mm] [--rings "10,-4;12,0;10,4"] [--out DIR] [--write-states DIR]
-  python shape_from_views.py poses      DATASET distances.txt attitudes.txt [focal_mm sensor_mm] [--baseline YAW PITCH ROLL] [--out DIR]
+  python shape_from_views.py estimate   DATASET [focal_mm sensor_mm] [--out DIR] [--origin PHOTO] [--distance D]
+  python shape_from_views.py poses      DATASET distances.txt attitudes.txt [focal_mm sensor_mm] [--baseline YAW PITCH ROLL] [--photos LIST] [--out DIR]
   python shape_from_views.py hull       --data DATASET [--voxel-num 64] [--passB-res 200] [--min-votes N] [--max-misses N] [--solid] ...
   python shape_from_views.py subset     DATASET (--random N [--seed 42] | --every N) [--out DIR]
   python shape_from_views.py to-txt     SPARSE_DIR
@@ -14,11 +15,12 @@ import shutil
 import sys
 from pathlib import Path
 
+import numpy as np
 from PIL import Image as PILImage
 
 import visual_hull as vh
 from colmap import (Camera, Image, read_model, write_cameras_bin, write_images_bin, write_model)
-from poses import orbit_states, pose_from_state, rotmat_to_qvec, to_differential
+from poses import orbit_states, pose_from_state, rotmat_to_qvec, state_from_pose, to_differential
 
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png")
 
@@ -122,18 +124,82 @@ def cmd_orbit(args):
         print(f"wrote {out}/distances.txt and attitudes.txt; replay them with --baseline {baseline[0]!r} {baseline[1]!r} {baseline[2]!r}")
 
 
+def read_photo_list(path, available):
+    """Photo names, one per line (the rows of the state lists belong to these photos, in this order)."""
+    names = [line.strip() for line in Path(path).read_text(encoding="utf-8").splitlines() if line.strip()]
+    missing = [n for n in names if n not in available]
+    if missing:
+        sys.exit(f"error: {path} names photos that are not in images/: {missing[:3]}")
+    return names
+
+
 def cmd_poses(args):
     names, (width, height) = list_images(Path(args.dataset) / "images")
+    if args.photos:                                   # the rows belong to these photos (e.g. the ones `estimate` placed)
+        names = read_photo_list(args.photos, set(names))
     distances = [row[0] for row in read_rows(args.distances, 1)]
     attitudes = read_rows(args.attitudes, 3)
     if not (len(distances) == len(attitudes) == len(names)):
-        sys.exit(f"error: {len(names)} images but {len(distances)} distances and {len(attitudes)} attitudes")
+        sys.exit(f"error: {len(names)} {'listed photos' if args.photos else 'images'} but {len(distances)} distances "
+                 f"and {len(attitudes)} attitudes")
     if args.baseline is None:
         print("warning: no --baseline given; frame 0 is assumed to be level with the target (yaw 0, pitch 0, roll 0)")
     yaw0, pitch0, roll0 = args.baseline or (0.0, 0.0, 0.0)
     states = [(d, yaw0 + dy, pitch0 + dp, roll0 + dr) for d, (dy, dp, dr) in zip(distances, attitudes)]
     write_generated_model(args.out or args.dataset, render_camera(width, height, args.focal_mm, args.sensor_mm), names, states)
     print(f"baseline (deg): yaw {yaw0}, pitch {pitch0}, roll {roll0}")
+
+
+def relative_to_states(R_rel, d_rel, distance):
+    """(distance, yaw, pitch, roll) rows from what `estimate` measures: each observer's attitude R_rel relative to
+    observer 1 and its distance as a multiple of observer 1's. Observer 1 is the origin: yaw 0, pitch 0, roll 0 at
+    `distance` (replay with --baseline 0 0 0). Neither choice changes the shape: the origin only turns the scene,
+    the distance only scales it."""
+    R0, _ = pose_from_state(distance, 0.0, 0.0, 0.0)
+    return [state_from_pose(Rr @ R0, float(dr) * distance) for Rr, dr in zip(R_rel, d_rel)]
+
+
+def write_state_lists(out, names, states):
+    """distances.txt, attitudes.txt and photos.txt (which photo each row belongs to), rows in photo-name order."""
+    out = Path(out)
+    out.mkdir(parents=True, exist_ok=True)
+    rows = dict(zip(names, states))
+    order = sorted(rows)
+    (out / "photos.txt").write_text("".join(f"{n}\n" for n in order))
+    (out / "distances.txt").write_text("".join(f"{rows[n][0]!r}\n" for n in order))
+    (out / "attitudes.txt").write_text("".join(f"{rows[n][1]!r} {rows[n][2]!r} {rows[n][3]!r}\n" for n in order))
+
+
+def cmd_estimate(args):
+    """State lists measured from the photos: every photo's attitude and distance relative to observer 1."""
+    import estimate                                   # needs torch, lightglue, numba, opencv and scipy
+    data = Path(args.dataset)
+    names, (width, height) = list_images(data / "images")
+    if args.origin:
+        if args.origin not in names:
+            sys.exit(f"error: --origin {args.origin} is not in {data / 'images'}")
+        names.remove(args.origin)
+        names.insert(0, args.origin)                  # observer 1 = the origin: every estimate is relative to it
+    masks = [vh.find_mask(data / "masks", n) for n in names]
+    if None in masks:
+        sys.exit(f"error: no mask for {names[masks.index(None)]} in {data / 'masks'}")
+    camera = render_camera(width, height, args.focal_mm, args.sensor_mm)
+    f, cx, cy = camera.params
+    K = np.array([[f, 0.0, cx - 0.5], [0.0, f, cy - 0.5], [0.0, 0.0, 1.0]])   # OpenCV pixel centres sit at integers
+    estimate.warm_up()
+    result = estimate.estimate([data / "images" / n for n in names], masks, K,
+                               progress=lambda stage, s: print(f"  {stage:9s} {s:7.2f} s", flush=True))
+    placed = [names[i] for i in result["registered"]]
+    if not placed or placed[0] != names[0]:
+        sys.exit(f"error: observer 1 ({names[0]}) could not be placed: {result.get('status', 'no reason given')}")
+    out = Path(args.out) if args.out else data / "states"
+    write_state_lists(out, placed, relative_to_states(result["R_rel"], result["d_rel"], args.distance))
+    print(f"placed {len(placed)} of {len(names)} photos in {result['seconds']:.1f} s (observer 1 = {names[0]})")
+    for index, reason in sorted(result.get("dropped", {}).items()):
+        print(f"  not placed: {names[int(index)]} ({reason})")
+    print(f"wrote {out}/distances.txt, attitudes.txt and photos.txt; replay them with\n"
+          f"  python shape_from_views.py poses {data} {out}/distances.txt {out}/attitudes.txt "
+          f"--baseline 0 0 0 --photos {out}/photos.txt")
 
 
 def cmd_hull(args):
@@ -241,7 +307,18 @@ def parse_args(argv):
     lens_and_output(p)
     p.add_argument("--baseline", type=float, nargs=3, metavar=("YAW", "PITCH", "ROLL"),
                    help="absolute attitude of frame 0 in degrees (the lists hold differences)")
+    p.add_argument("--photos", help="the rows belong to the photos named in this file (default: all images, by name)")
     p.set_defaults(run=cmd_poses)
+
+    p = commands.add_parser("estimate", help="state lists measured from the photos (observer 1 = the origin)")
+    p.add_argument("dataset", help="folder with images/ and masks/")
+    p.add_argument("focal_mm", type=float, nargs="?", default=40.0, help="lens focal length (default 40)")
+    p.add_argument("sensor_mm", type=float, nargs="?", default=36.0, help="sensor width (default 36)")
+    p.add_argument("--out", help="folder for distances.txt, attitudes.txt and photos.txt (default DATASET/states)")
+    p.add_argument("--origin", help="the photo that is observer 1 (default: the first by name)")
+    p.add_argument("--distance", type=float, default=1.0,
+                   help="observer 1's distance to the target: sets the scale only, not the shape (default 1)")
+    p.set_defaults(run=cmd_estimate)
 
     p = commands.add_parser("hull", help="visual hull from images + masks + sparse/0")
     p.add_argument("--data", required=True, help="dataset folder")

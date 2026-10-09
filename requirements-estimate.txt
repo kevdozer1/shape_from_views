@@ -1,0 +1,7 @@
+# Extra packages for `shape_from_views.py estimate` (estimate.py) only; the rest needs requirements.txt.
+# Install PyTorch with CUDA for your GPU first (https://pytorch.org); the estimator also runs on the CPU, much slower.
+torch>=2.1
+lightglue @ git+https://github.com/cvg/LightGlue.git    # SuperPoint + LightGlue (weights download on first use)
+numba>=0.58
+opencv-python>=4.8
+scipy>=1.10

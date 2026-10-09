@@ -94,6 +94,19 @@ def pose_from_state(distance, yaw_deg, pitch_deg, roll_deg=0.0):
     return R, t
 
 
+def state_from_pose(R, distance):
+    """The inverse of pose_from_state: (distance, yaw, pitch, roll) of the camera with world-to-camera
+    rotation R that sits `distance` from the target and looks straight at it (pitch must not be +-90)."""
+    C = [-distance * R[2][j] for j in range(3)]          # it looks along R[2], at the origin
+    yaw = math.degrees(math.atan2(C[0], -C[1]))
+    pitch = math.degrees(math.asin(max(-1.0, min(1.0, C[2] / distance))))
+    L = look_at(C)                                       # the same camera before its roll
+    # R = Rroll @ L, so Rroll = R @ L^T = [[c, -s, 0], [s, c, 0], [0, 0, 1]]
+    c = R[0][0] * L[0][0] + R[0][1] * L[0][1] + R[0][2] * L[0][2]
+    s = R[1][0] * L[0][0] + R[1][1] * L[0][1] + R[1][2] * L[0][2]
+    return distance, yaw, pitch, math.degrees(math.atan2(s, c))
+
+
 def orbit_states(n_images, rings):
     """Absolute (distance, yaw, pitch, roll) per frame for cameras circling the origin.
 

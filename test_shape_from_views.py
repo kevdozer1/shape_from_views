@@ -18,7 +18,7 @@ import shape_from_views as cli
 import visual_hull as vh
 from colmap import Camera, Image, Point3D, project, read_model, write_model
 from poses import (look_at, orbit_states, pose_from_state, qvec_to_rotmat, rotmat_to_qvec,
-                   to_differential)
+                   state_from_pose, to_differential)
 
 # ----------------------------------------------------------------------------- the synthetic object
 
@@ -150,6 +150,37 @@ def test_orbit_states_replay_through_poses(tmp_path):
     # the camera positions are exactly the rings
     R, t = pose_from_state(*states[150])               # middle ring, 30th frame: yaw 90
     assert np.allclose(-R.T @ t, [12.0, 0.0, 0.0])
+
+
+def test_state_from_pose_inverts_pose_from_state():
+    rng = np.random.default_rng(3)
+    for _ in range(200):
+        state = (rng.uniform(1, 20), rng.uniform(-179, 179), rng.uniform(-85, 85), rng.uniform(-179, 179))
+        R, t = pose_from_state(*state)
+        assert np.allclose(state_from_pose(R, t[2]), state, atol=1e-9)
+
+
+def test_relative_estimates_replay_through_poses(plane, tmp_path):
+    """What `estimate` writes (attitudes relative to observer 1, distances as multiples of its distance) goes
+    through `poses --photos` and gives back the true cameras, up to the origin's turn and the scale."""
+    folder, _, _ = plane
+    _, images, _ = read_model(folder / "sparse" / "0")
+    by_name = {im.name: im for im in images.values()}
+    photos = sorted(by_name)[::3][::-1]                 # a subset, observer 1 not first by name
+    R = np.stack([qvec_to_rotmat(by_name[n].qvec) for n in photos])
+    t = np.stack([np.array(by_name[n].tvec) for n in photos])
+    d = t[:, 2]                                         # the cameras look at the origin: t = (0, 0, distance)
+    cli.write_state_lists(tmp_path / "states", photos, cli.relative_to_states(R @ R[0].T, d / d[0], 2.5))
+    cli.main(["poses", str(folder), str(tmp_path / "states" / "distances.txt"), str(tmp_path / "states" / "attitudes.txt"),
+              "--baseline", "0", "0", "0", "--photos", str(tmp_path / "states" / "photos.txt"), "--out", str(tmp_path)])
+    _, replayed, _ = read_model(tmp_path / "sparse" / "0")
+    got = {im.name: im for im in replayed.values()}
+    assert sorted(got) == sorted(photos)
+    Rg = np.stack([qvec_to_rotmat(got[n].qvec) for n in photos])
+    tg = np.stack([np.array(got[n].tvec) for n in photos])
+    assert np.allclose(Rg @ Rg[0].T, R @ R[0].T, atol=1e-9)          # same relative attitudes
+    assert np.allclose(tg[:, 2] / 2.5, d / d[0], atol=1e-9)          # same relative distances, scaled by 2.5
+    assert np.allclose(Rg[0], pose_from_state(2.5, 0, 0, 0)[0])      # observer 1 at yaw/pitch/roll 0
 
 
 def test_bad_arguments_are_errors(plane):
